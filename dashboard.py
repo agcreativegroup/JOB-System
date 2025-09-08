@@ -1,432 +1,278 @@
-# ========================================
-#  JOB MARKET DASHBOARD + RECOMMENDER
-# ========================================
-import os
-os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"   # quiet TensorFlow CPU note
-
-print(os.listdir("models"))
-import io
-import ast
-import json
-import requests
-import numpy as np
-import pandas as pd
-import plotly.express as px
 import streamlit as st
-from prophet import Prophet
-
-# --- DL / NLP ---
-import tensorflow as tf
+import pandas as pd
+import numpy as np
+import pickle
+import plotly.express as px
 from tensorflow.keras.models import load_model
-try:
-    # prefer TF-keras if present (Transformers compat)
-    from keras.preprocessing.sequence import pad_sequences
-    from keras.preprocessing.text import Tokenizer
-except Exception:
-    from tensorflow.keras.preprocessing.sequence import pad_sequences
-    from tensorflow.keras.preprocessing.text import Tokenizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
-from transformers import BertTokenizer, TFBertForSequenceClassification
-from sklearn.preprocessing import LabelEncoder
-
-# -----------------------------
-# Streamlit Page Config
-# -----------------------------
-st.set_page_config(page_title="Job Market Dashboard", layout="wide")
-st.title("Job Market Dynamics Dashboard + Job Recommender")
-
-# -----------------------------
-# Helpers (cache-aware)
-# -----------------------------
-STOPWORDS = {
-    "and","or","to","a","the","in","of","for","on","with","at","by","an","is","are",
-    "from","as","it","this","that","be","we","i","you","they","our","us","your","needed","looking","want","-",
-    ":", "&", "amp", ".", ",", "(", ")", "[", "]", "{", "}", "/", "\\"
-}
-
-def parse_keywords(cell):
-    """Safely parse the keywords column into a clean list."""
-    if isinstance(cell, list):
-        raw = cell
-    else:
-        try:
-            raw = ast.literal_eval(str(cell))
-        except Exception:
-            raw = []
-    cleaned = []
-    for w in raw:
-        w = str(w).strip().lower()
-        if not w:
-            continue
-        if w in {"-", ":", ".", ",", "&", "amp"}:
-            continue
-        if w in STOPWORDS:
-            continue
-        cleaned.append(w)
-    return cleaned
-
-@st.cache_data(show_spinner=False)
-def load_csv(file_like) -> pd.DataFrame:
-    df = pd.read_csv(file_like)
-    return df
-
-@st.cache_data(show_spinner=False)
-def preprocess(df: pd.DataFrame) -> pd.DataFrame:
-    # expected columns: ['title','link','published_date','is_hourly','hourly_low','hourly_high','budget','country','job_title_clean','keywords','year_month']
-    if 'year_month_str' not in df.columns:
-        # build from published_date or year_month
-        if 'published_date' in df.columns:
-            tm = pd.to_datetime(df['published_date'], errors='coerce')
-            df['year_month_str'] = tm.dt.to_period('M').astype(str)
-        elif 'year_month' in df.columns:
-            df['year_month_str'] = pd.to_datetime(df['year_month']).dt.to_period('M').astype(str)
-        else:
-            # fallback: everything as one month
-            df['year_month_str'] = '1970-01'
-    else:
-        df['year_month_str'] = pd.to_datetime(df['year_month_str'], errors='coerce')
-        df['year_month_str'] = df['year_month_str'].dt.to_period('M').astype(str)
-
-    # Remote flag from title
-    df['remote'] = df.get('job_title_clean', df.get('title','')).astype(str).str.contains(
-        r"\b(remote|work from home|telecommute|wfh)\b", case=False, na=False
-    )
-
-    # Numeric hourly
-    for c in ['hourly_low','hourly_high','budget']:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors='coerce')
-
-    # Average hourly if present
-    if {'hourly_low','hourly_high'}.issubset(df.columns):
-        df['avg_hourly'] = (df['hourly_low'].fillna(0) + df['hourly_high'].fillna(0)) / 2.0
-
-    # Clean keywords to list
-    if 'keywords' in df.columns:
-        df['keywords'] = df['keywords'].apply(parse_keywords)
-    else:
-        df['keywords'] = [[] for _ in range(len(df))]
-
-    # Drop dupes by link if available
-    if 'link' in df.columns:
-        df = df.drop_duplicates(subset=['link'])
-    else:
-        df = df.drop_duplicates()
-
-    return df
-
-@st.cache_resource(show_spinner=False)
-def load_lstm():
+# -------------------------
+# Load Models
+# -------------------------
+@st.cache_resource
+def load_models():
+    models = {}
     try:
-        return load_model("models/job_lstm_model.h5")
+        models['cnn_job_classifier'] = load_model("cnn_job_classifier.h5", compile=False)
     except Exception:
-        return None
+        models['cnn_job_classifier'] = None
 
-@st.cache_resource(show_spinner=False)
-def load_cnn():
     try:
-        return load_model("models/job_cnn_model.h5")
+        models['cnn_salary_predictor'] = load_model("cnn_salary_predictor.h5", compile=False)
     except Exception:
-        return None
+        models['cnn_salary_predictor'] = None
 
-@st.cache_resource(show_spinner=False)
-def load_bert():
-    # prefer local fine-tuned folder if it exists
-    local_dir = "models/job_bert_model"
     try:
-        if os.path.isdir(local_dir):
-            tok = BertTokenizer.from_pretrained(local_dir)
-            mdl = TFBertForSequenceClassification.from_pretrained(local_dir)
-            return (tok, mdl)
-        return None
+        with open("cnn_tokenizer.pkl", "rb") as f:
+            models['cnn_tokenizer'] = pickle.load(f)
     except Exception:
-        return None
+        models['cnn_tokenizer'] = None
 
-# -----------------------------
-# Sidebar: Load & Real-time fetch
-# -----------------------------
-st.sidebar.header(" Data Source")
-
-uploaded = st.sidebar.file_uploader("Upload cleaned CSV (e.g., eda_jobs.csv)", type=["csv"])
-realtime_url = st.sidebar.text_input("Optional: CSV/JSON URL for real-time jobs")
-fetch_btn = st.sidebar.button("Fetch & Merge Real-time Data")
-
-if uploaded:
-    base_df = load_csv(uploaded)
-else:
-    st.sidebar.info("Upload a CSV to start. (You can also add a URL to fetch more data.)")
-    st.stop()
-
-data = preprocess(base_df)
-
-# --- Real-time fetch / merge (optional) ---
-if fetch_btn and realtime_url.strip():
     try:
-        r = requests.get(realtime_url.strip(), timeout=30)
-        r.raise_for_status()
-        content_type = r.headers.get("Content-Type","").lower()
+        with open("category_scaler.pkl", "rb") as f:
+            models['category_scaler'] = pickle.load(f)
+    except Exception:
+        models['category_scaler'] = None
 
-        # Support CSV or JSON
-        if "json" in content_type or realtime_url.strip().lower().endswith(".json"):
-            new_raw = pd.json_normalize(r.json())
-        else:
-            new_raw = pd.read_csv(io.StringIO(r.text))
+    try:
+        with open("job_category_encoder.pkl", "rb") as f:
+            models['job_category_encoder'] = pickle.load(f)
+    except Exception:
+        models['job_category_encoder'] = None
 
-        new_df = preprocess(new_raw)
-        # Concatenate & refresh cache
-        data = pd.concat([data, new_df], ignore_index=True)
-        data = preprocess(data)  # re-run to normalize post-merge
-        st.sidebar.success(f"Merged real-time rows: {len(new_df)}")
+    return models
+
+models = load_models()
+
+# -------------------------
+# Sidebar
+# -------------------------
+st.sidebar.title("📊 Job Market Analysis")
+page = st.sidebar.radio(
+    "Select Task:",
+    [
+        "🏠 Home Dashboard",
+        "📊 Task 1: Title-Salary Correlation",
+        "🚀 Task 2: Emerging Job Categories",
+        "📈 Task 3: High-Demand Roles (LSTM - placeholder)",  # ← keep label consistent
+        "🌍 Task 4: Hourly Rates by Country",
+        "🎯 Task 5: Job Recommendation Engine + Salary Prediction",
+        "📋 Task 6: Market Dynamics Dashboard",
+        "🏡 Task 7: Remote Work Trends",
+        "🔮 Task 8: CNN Demand Prediction"
+    ]
+)
+
+uploaded = st.sidebar.file_uploader("Upload Job Data (CSV)", type=["csv"])
+df = None
+if uploaded is not None:
+    try:
+        df = pd.read_csv(uploaded)
     except Exception as e:
-        st.sidebar.error(f"Fetch failed: {e}")
+        st.sidebar.error(f"Could not read CSV: {e}")
 
-# Save merged/cached dataset (optional)
-if st.sidebar.button(" Save merged dataset as eda_jobs_merged.csv"):
-    out_name = "eda_jobs_merged.csv"
-    data.to_csv(out_name, index=False)
-    st.sidebar.success(f"Saved {out_name}")
-
-# -----------------------------
-# Tabs Layout
-# -----------------------------
-tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    " Overview",
-    " Remote vs Onsite",
-    " Job Forecast",
-    " Keyword Forecast",
-    " Country Forecast",
-    " Recommendations"
-])
-
-# -----------------------------
-# 0. Overview (quick stats + salary map)
-# -----------------------------
-with tab0:
-    st.subheader(" Overview & Salary Map")
-
-    col_a, col_b, col_c, col_d = st.columns(4)
-    col_a.metric("Total Jobs", f"{len(data):,}")
-    col_b.metric("Countries", data['country'].nunique() if 'country' in data.columns else 0)
-    col_c.metric("Months Covered", data['year_month_str'].nunique())
-    remote_share = (100.0 * data['remote'].mean()) if 'remote' in data.columns else 0.0
-    col_d.metric("Remote Share", f"{remote_share:.1f}%")
-
-    if 'avg_hourly' in data.columns and 'country' in data.columns:
-        country_salary = (
-            data.dropna(subset=['avg_hourly','country'])
-                .groupby('country', as_index=False)['avg_hourly'].mean()
-        )
-        fig_map = px.choropleth(
-            country_salary, locations="country", locationmode="country names",
-            color="avg_hourly", hover_name="country",
-            title="Average Hourly Rate by Country", color_continuous_scale="Viridis"
-        )
-        st.plotly_chart(fig_map, use_container_width=True)
+# -------------------------
+# Home Dashboard
+# -------------------------
+if page == "🏠 Home Dashboard":
+    st.title("🏠 Job Market Dashboard")
+    if df is not None and not df.empty:
+        st.metric("Total Jobs", f"{len(df):,}")
+        if "country" in df.columns:
+            st.metric("Countries", df['country'].nunique())
+        if "budget" in df.columns and pd.api.types.is_numeric_dtype(df['budget']):
+            st.metric("Avg Salary", f"${df['budget'].mean():,.0f}")
+        st.subheader("🔍 Data Preview")
+        st.dataframe(df.head())
     else:
-        st.info("No hourly fields to build salary map (needs hourly_low & hourly_high).")
+        st.info("📂 Upload a dataset in the sidebar.")
 
-# -----------------------------
-# 1. Remote vs Onsite Trend
-# -----------------------------
-with tab1:
-    st.subheader(" Remote vs Onsite Jobs Over Time")
-    remote_trend = (data.groupby(['year_month_str','remote'])
-                        .size().reset_index(name='count'))
-    fig_remote = px.line(
-        remote_trend, x="year_month_str", y="count", color="remote",
-        title="Remote vs Onsite Job Trend"
-    )
-    st.plotly_chart(fig_remote, use_container_width=True)
-
-# -----------------------------
-# 2. Job Market Forecast (Prophet)
-# -----------------------------
-with tab2:
-    st.subheader("Job Market Forecast (Next 6 Months)")
-    job_trend = data.groupby('year_month_str').size().reset_index(name='count')
-    job_trend = job_trend.rename(columns={'year_month_str':'ds','count':'y'})
-    job_trend['ds'] = pd.to_datetime(job_trend['ds'])
-
-    if len(job_trend) >= 3:
-        model = Prophet()
-        model.fit(job_trend[['ds','y']])
-        future = model.make_future_dataframe(periods=6, freq='M')
-        forecast = model.predict(future)
-        fig_forecast = px.line(forecast, x="ds", y="yhat",
-                               title="Predicted Job Market Trend (Next 6 Months)")
-        st.plotly_chart(fig_forecast, use_container_width=True)
+# -------------------------
+# Task 1: Title-Salary Correlation
+# -------------------------
+elif page == "📊 Task 1: Title-Salary Correlation":
+    st.title("📊 Job Title-Salary Correlation")
+    if df is None:
+        st.info("📂 Upload a dataset in the sidebar.")
+    elif {"title", "budget"}.issubset(df.columns):
+        # Ensure numeric budget
+        df = df.copy()
+        df['budget'] = pd.to_numeric(df['budget'], errors='coerce')
+        df['title_len'] = df['title'].astype(str).str.len()
+        fig = px.scatter(df.dropna(subset=["budget"]), x="title_len", y="budget",
+                         title="Salary vs Job Title Length")
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("Need at least 3 monthly points to forecast.")
+        st.warning("Dataset must contain 'title' and 'budget' columns.")
 
-# -----------------------------
-# 3. Keyword Forecasting
-# -----------------------------
-with tab3:
-    st.subheader(" Keyword-Level Forecasting")
-    # explode keywords over months
-    trend_keywords = []
-    for _, row in data[['year_month_str','keywords']].iterrows():
-        for kw in row['keywords']:
-            trend_keywords.append((row['year_month_str'], kw))
-    if trend_keywords:
-        trend_df = pd.DataFrame(trend_keywords, columns=['year_month_str','keyword'])
-        keyword_trend = (trend_df
-                         .groupby(['year_month_str','keyword'])
-                         .size().reset_index(name='count'))
+# -------------------------
+# Task 2: Emerging Job Categories
+# -------------------------
+elif page == "🚀 Task 2: Emerging Job Categories":
+    st.title("🚀 Emerging Job Categories")
+    if df is None:
+        st.info("📂 Upload a dataset in the sidebar.")
+    elif "job_category" in df.columns:
+        cat_counts = df['job_category'].value_counts().head(10)
+        st.subheader("Top Job Categories")
+        st.bar_chart(cat_counts)
+    else:
+        st.warning("Dataset must contain 'job_category'.")
 
-        top_keywords = trend_df['keyword'].value_counts().head(8).index
-        selected_kw = st.selectbox("Select a Keyword:", top_keywords)
+# -------------------------
+# Task 3: High-Demand Roles (LSTM placeholder)
+# -------------------------
+elif page == "📈 Task 3: High-Demand Roles (LSTM - placeholder)":
+    st.title("📈 High-Demand Roles Prediction (LSTM)")
+    if df is None:
+        st.info("📂 Upload a dataset in the sidebar.")
+    else:
+        # Detect a date column
+        date_col = next((c for c in df.columns if "date" in c.lower()), None)
 
-        kw_data = keyword_trend[keyword_trend['keyword'] == selected_kw].copy()
-        kw_data = kw_data.rename(columns={'year_month_str':'ds','count':'y'})
-        kw_data['ds'] = pd.to_datetime(kw_data['ds'])
-
-        fig_kw_hist = px.line(keyword_trend[keyword_trend['keyword'].isin(top_keywords)],
-                              x='year_month_str', y='count', color='keyword',
-                              title="Top Keyword Frequencies Over Time")
-        st.plotly_chart(fig_kw_hist, use_container_width=True)
-
-        if len(kw_data) >= 3:
-            model_kw = Prophet()
-            model_kw.fit(kw_data[['ds','y']])
-            future_kw = model_kw.make_future_dataframe(periods=6, freq='M')
-            forecast_kw = model_kw.predict(future_kw)
-            fig_kw = px.line(forecast_kw, x="ds", y="yhat",
-                             title=f"Forecast for '{selected_kw}' (Next 6 Months)")
-            st.plotly_chart(fig_kw, use_container_width=True)
+        if not date_col:
+            st.error("❌ No date-like column found in dataset. Add 'published_date' or similar.")
         else:
-            st.info("Need ≥3 points for this keyword to forecast.")
-    else:
-        st.info("No keywords available in dataset.")
+            df = df.copy()
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+            daily = df.dropna(subset=[date_col]).groupby(df[date_col].dt.date).size()
 
-# -----------------------------
-# 4. Country-Level Keyword Forecast
-# -----------------------------
-with tab4:
-    st.subheader(" Country-Level Keyword Forecast")
-    if 'country' not in data.columns:
-        st.info("No 'country' column found.")
-    else:
-        trend_list = []
-        for _, row in data[['year_month_str','country','keywords']].iterrows():
-            for kw in row['keywords']:
-                trend_list.append((row['year_month_str'], row['country'], kw))
-        if trend_list:
-            tdf = pd.DataFrame(trend_list, columns=['year_month_str','country','keyword'])
-            agg = tdf.groupby(['year_month_str','country','keyword']).size().reset_index(name='count')
-            top_kw_country = tdf['keyword'].value_counts().head(10).index
-            selected_kw2 = st.selectbox("Keyword", top_kw_country)
-            sub = agg[agg['keyword'] == selected_kw2]
-            if sub.empty:
-                st.info("No data for this keyword.")
+            st.write(f"📊 Found {len(daily)} daily data points from {daily.index.min()} → {daily.index.max()}")
+
+            if len(daily) == 0:
+                st.error("❌ No valid daily job counts. Check your dataset.")
             else:
-                chosen_country = st.selectbox("Country", sorted(sub['country'].unique()))
-                cdata = sub[sub['country'] == chosen_country].copy()
-                cdata = cdata.rename(columns={'year_month_str':'ds','count':'y'})
-                cdata['ds'] = pd.to_datetime(cdata['ds'])
-                if len(cdata) >= 3:
-                    model_c = Prophet()
-                    model_c.fit(cdata[['ds','y']])
-                    future_c = model_c.make_future_dataframe(periods=6, freq='M')
-                    forecast_c = model_c.predict(future_c)
-                    fig_c = px.line(forecast_c, x="ds", y="yhat",
-                                    title=f"Forecast for '{selected_kw2}' in {chosen_country}")
-                    st.plotly_chart(fig_c, use_container_width=True)
-                else:
-                    st.info("Need ≥3 points for this country-keyword pair to forecast.")
-        else:
-            st.info("No country/keyword pairs available.")
+                hist_df = pd.DataFrame({"date": pd.to_datetime(daily.index), "jobs": daily.values})
 
-# -----------------------------
-# 5. Job Recommendation System
-# -----------------------------
-with tab5:
-    st.subheader(" Job Recommendation System")
+                # Try loading model + scaler
+                try:
+                    lstm_model = load_model("lstm_job_volume.h5", compile=False)
+                    with open("job_volume_scaler.pkl", "rb") as f:
+                        scaler = pickle.load(f)
+                except Exception as e:
+                    st.warning(f"⚠️ Could not load LSTM model or scaler: {e}")
+                    lstm_model, scaler = None, None
 
-    import pickle
-    # Load only Keras Tokenizer + LabelEncoder
-    try:
-        with open("models/keras_tokenizer.pkl", "rb") as f:
-            keras_tokenizer = pickle.load(f)
-        with open("models/label_encoder.pkl", "rb") as f:
-            label_encoder = pickle.load(f)
-    except Exception as e:
-        st.error(f"Tokenizer/LabelEncoder not found in models/: {e}")
-        st.stop()
-
-    user_input = st.text_input("Enter a job title or description:")
-
-    colL, colC, colB = st.columns(3)
-    lstm_model = load_lstm()
-    cnn_model  = load_cnn()
-    bert_pack  = load_bert()
-
-    if st.button("Get Recommendations"):
-        if not user_input.strip():
-            st.warning("Please enter a job description.")
-        else:
-            # ---------------------
-            # LSTM + CNN (Keras Tokenizer)
-            # ---------------------
-            try:
-                seq = keras_tokenizer.texts_to_sequences([user_input])
-                padded = pad_sequences(seq, maxlen=50, padding="post", truncating="post")
-            except Exception as e:
-                st.error(f"Keras Tokenizer error: {e}")
-                padded = None
-
-            # LSTM Prediction
-            with colL:
-                if lstm_model is not None and padded is not None:
+                forecast_df = None
+                if lstm_model is not None and scaler is not None and len(hist_df) >= 30:
                     try:
-                        pred_lstm = np.argmax(lstm_model.predict(padded), axis=1)
-                        st.success(" LSTM: " + label_encoder.inverse_transform(pred_lstm)[0])
+                        daily_vals = hist_df["jobs"].values.reshape(-1, 1)
+                        scaled = scaler.transform(daily_vals)
+                        X_seq = np.expand_dims(scaled[-30:], axis=0)
+
+                        preds = lstm_model.predict(X_seq)
+                        preds = scaler.inverse_transform(preds.reshape(-1, 1)).flatten()
+
+                        last_date = hist_df["date"].iloc[-1]
+                        future_dates = pd.date_range(last_date + pd.Timedelta(days=1), periods=len(preds))
+
+                        forecast_df = pd.DataFrame({"date": future_dates, "jobs": preds})
+                        st.success("✅ Forecast generated with LSTM model.")
                     except Exception as e:
-                        st.warning(f"LSTM error: {e}")
+                        st.error(f"❌ Error during LSTM prediction: {e}")
+
+                # Plot
+                fig = px.line(hist_df, x="date", y="jobs", title="Job Market Volume (History & Forecast)")
+                if forecast_df is not None:
+                    fig.add_scatter(x=forecast_df["date"], y=forecast_df["jobs"],
+                                    mode="lines+markers", name="Forecast")
                 else:
-                    st.warning(" LSTM model not found or tokenizer failed.")
+                    st.warning("⚠️ Showing history only (no forecast).")
+                st.plotly_chart(fig, use_container_width=True)
 
-            # CNN Prediction
-            with colC:
-                if cnn_model is not None and padded is not None:
-                    try:
-                        pred_cnn = np.argmax(cnn_model.predict(padded), axis=1)
-                        st.success(" CNN: " + label_encoder.inverse_transform(pred_cnn)[0])
-                    except Exception as e:
-                        st.warning(f"CNN error: {e}")
-                else:
-                    st.warning(" CNN model not found or tokenizer failed.")
-
-           # ---------------------
-# BERT (HuggingFace Tokenizer)
-# ---------------------
-with colB:
-    if bert_pack is not None:
-        try:
-            tokenizer_bert, model_bert = bert_pack
-            st.write("✅ BERT model loaded successfully.")  # Debug message
-
-            enc = tokenizer_bert(
-                [user_input],
-                truncation=True,
-                padding=True,
-                max_length=32,
-                return_tensors="tf"
-            )
-            # Explicitly pass inputs
-            outputs = model_bert(
-                input_ids=enc["input_ids"],
-                attention_mask=enc["attention_mask"],
-                training=False
-            )
-            logits = outputs.logits
-            pred_id = int(tf.argmax(logits, axis=1).numpy()[0])
-
-            st.success(" BERT: " + label_encoder.inverse_transform([pred_id])[0])
-        except Exception as e:
-            st.error(f" BERT prediction error: {e}")
+# -------------------------
+# Task 4: Hourly Rates by Country
+# -------------------------
+elif page == "🌍 Task 4: Hourly Rates by Country":
+    st.title("🌍 Hourly Rates by Country")
+    if df is None:
+        st.info("📂 Upload a dataset in the sidebar.")
+    elif {'country', 'budget'}.issubset(df.columns):
+        tmp = df.copy()
+        tmp['budget'] = pd.to_numeric(tmp['budget'], errors='coerce')
+        avg_rates = tmp.groupby("country")['budget'].mean().reset_index().dropna()
+        fig = px.bar(avg_rates, x="country", y="budget", title="Average Pay by Country")
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        st.error(" BERT model not found (expected folder: /job_bert_model/)")
+        st.warning("Dataset must contain 'country' and 'budget'.")
 
+# -------------------------
+# Task 5: Job Recommendation + Salary Prediction
+# -------------------------
+elif page == "🎯 Task 5: Job Recommendation Engine + Salary Prediction":
+    st.title("🎯 Job Recommendation & Salary Prediction")
+    if df is None:
+        st.info("📂 Upload a dataset in the sidebar.")
+    else:
+        user_input = st.text_area("Enter your skills or job preferences:")
+        if st.button("Recommend Jobs"):
+            desc_col = df['description'] if 'description' in df.columns else pd.Series([''] * len(df))
+            text_field = df['title'].fillna('') + " " + desc_col.fillna('')
+            tfidf = TfidfVectorizer(stop_words="english")
+            tfidf_matrix = tfidf.fit_transform(text_field)
+            user_vec = tfidf.transform([user_input])
+            sim = cosine_similarity(user_vec, tfidf_matrix).flatten()
+            top_idx = sim.argsort()[-5:][::-1]
+            cols = [c for c in ['title', 'country', 'job_category', 'budget'] if c in df.columns]
+            result = df.iloc[top_idx][cols].copy()
+            st.subheader("🔎 Recommended Jobs")
+            st.dataframe(result)
 
-    st.caption(" Tip: Place your trained models in ./models (job_lstm_model.h5, job_cnn_model.h5, job_bert_model/, keras_tokenizer.pkl, label_encoder.pkl).")
+            # Salary prediction using CNN
+            if models['cnn_salary_predictor'] is not None and models['cnn_tokenizer'] is not None:
+                seq = models['cnn_tokenizer'].texts_to_sequences([user_input])
+                seq_pad = pad_sequences(seq, maxlen=50)
+                salary_pred = models['cnn_salary_predictor'].predict(seq_pad)
+                st.success(f"💰 Predicted Salary: ${salary_pred[0][0]:,.0f}")
+            else:
+                st.info("⚠️ Salary predictor not available.")
+
+# -------------------------
+# Task 6: Market Dynamics
+# -------------------------
+elif page == "📋 Task 6: Market Dynamics Dashboard":
+    st.title("📋 Job Market Dynamics")
+    if df is None:
+        st.info("📂 Upload a dataset in the sidebar.")
+    elif "published_date" in df.columns:
+        tmp = df.copy()
+        tmp['published_date'] = pd.to_datetime(tmp['published_date'], errors='coerce')
+        monthly = tmp.dropna(subset=['published_date']).groupby(tmp['published_date'].dt.to_period("M")).size()
+        monthly = monthly.rename("jobs").to_frame()
+        # Convert PeriodIndex -> Timestamp (month start) for plotting
+        monthly.index = monthly.index.to_timestamp()
+        st.line_chart(monthly)
+    else:
+        st.warning("Dataset must contain 'published_date'.")
+
+# -------------------------
+# Task 7: Remote Work Trends
+# -------------------------
+elif page == "🏡 Task 7: Remote Work Trends":
+    st.title("🏡 Remote Work Trends")
+    if df is None:
+        st.info("📂 Upload a dataset in the sidebar.")
+    elif "description" in df.columns:
+        remote_jobs = df['description'].astype(str).str.contains(r"\b(remote|wfh)\b", case=False, regex=True).mean() * 100
+        st.metric("Remote Job %", f"{remote_jobs:.2f}%")
+    else:
+        st.warning("Dataset must contain 'description'.")
+
+# -------------------------
+# Task 8: CNN Demand Prediction
+# -------------------------
+elif page == "🔮 Task 8: CNN Demand Prediction":
+    st.title("🔮 CNN Job Demand Prediction")
+    if models['cnn_job_classifier'] is not None and models['cnn_tokenizer'] is not None:
+        user_input = st.text_input("Enter a job title to predict demand:")
+        if st.button("Predict Demand"):
+            seq = models['cnn_tokenizer'].texts_to_sequences([user_input])
+            seq_pad = pad_sequences(seq, maxlen=50)
+            pred = models['cnn_job_classifier'].predict(seq_pad)
+            class_idx = int(np.argmax(pred))
+            categories = ["Low Demand", "Medium Demand", "High Demand"]
+            st.success(f"Predicted Demand: {categories[class_idx]} ({pred[0][class_idx]*100:.1f}% confidence)")
+    else:
+        st.info("⚠️ CNN classifier not available. Upload models or check paths.")
